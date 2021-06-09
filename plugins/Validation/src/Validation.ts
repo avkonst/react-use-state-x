@@ -1,223 +1,340 @@
+/* tslint:disable:no-any */
+import { Path, PluginCallbacks, StateValueAtRoot, State } from '@hookstate/core';
 
-import { Plugin, Path, StateValueAtPath, State } from '@hookstate/core';
+const ValidationId = Symbol('Validation');
 
-export type ValidationSeverity = 'error' | 'warning';
+type ValidateFn<T> = (value: T, ...depends: State<any>[]) => boolean;
 
-export interface ValidationError {
-    readonly message: string;
-    readonly path: Path;
-    readonly severity: ValidationSeverity;
+interface NestedState {
+    state: State<any>;
+    parent?: NestedState;
 }
 
-export interface ValidationExtensions<S> {
-    validate(attachRule: (value: S) => boolean,
-        message: string | ((value: S) => string),
-        severity?: ValidationSeverity): void,
-    validShallow(): boolean,
-    valid(): boolean,
-    invalidShallow(): boolean,
-    invalid(): boolean,
-    firstError(
-        filter?: (e: ValidationError) => boolean,
-        depth?: number
-    ): Partial<ValidationError>,
-    errors(
-        filter?: (e: ValidationError) => boolean,
-        depth?: number,
-        first?: boolean
-    ): ReadonlyArray<ValidationError>,
+interface SingleValidator<T> {
+    required(message?: string): void;
+
+    validate(validator: ValidateFn<T>, message?: string): void;
 }
 
-const PluginID = Symbol('Validate');
+type DetectValidator<T> = T extends string | number | boolean ? SingleValidator<T> :
+    T extends any[] ? ArrayValidator<T> : ObjectValidator<T>;
 
-const emptyErrors: ValidationError[] = []
+type FieldValidator<T> = {
+    [Key in keyof T]: DetectValidator<T[Key]>
+};
 
-interface ValidationRule {
-    readonly message: string | ((value: StateValueAtPath) => string)
-    readonly rule: (v: StateValueAtPath) => boolean
-    readonly severity: ValidationSeverity;
+type Depends<T> = { [P in keyof T]: DetectValidator<T[P]> };
+
+type Dependency<T> = { [P in keyof T]: T[P] extends any[] ? ReadonlyArray<State<T[P][0]>> : State<T[P]> };
+
+type ObjectValidator<T> = SingleValidator<T> & FieldValidator<T> & {
+    whenType<K extends keyof T, V extends T[K]>(key: K, value: V):
+        ObjectValidator<T & { [Key in keyof Pick<T, K>]: V }>;
+};
+
+type ArrayValidator<T extends any[]> = SingleValidator<T> & FieldValidator<T[0]> & {
+    whenType<K extends keyof T[0], V extends T[0][K]>(key: K, value: V):
+        ArrayValidator<(T[0] & { [Key in keyof Pick<T[0], K>]: V })[]>;
+
+    when<D extends unknown[]>(
+        fn: (value: State<T[0]>, ...dependencies: Dependency<D>) => boolean,
+        ...depends: Depends<D>
+    ): ArrayValidator<T>;
+};
+
+interface Condition {
+    fn: (value: any, root: any) => boolean;
+    path: Path;
+    root: State<any>;
 }
 
-class ValidationPluginInstance<S> {
-    private storeRules = {};
+interface Validator {
+    fn: ValidateFn<any>;
+    path: Path;
+    message?: string;
+    required?: boolean;
+    conditions: Condition[];
+}
 
-    getRulesAndNested(path: Path): [ValidationRule[], string[]] {
-        let result = this.storeRules;
-        path.forEach(p => {
-            if (typeof p === 'number') {
-                p = '*' // limitation: support only validation for each element of array
-            }
-            result = result && (result[p])
-        });
-        return [result && result[PluginID] ? Array.from(result[PluginID].values()) : [],
-            result ? Object.keys(result) : []];
-    }
-    addRule(path: Path, r: ValidationRule) {
-        let result = this.storeRules;
-        path.forEach((p, i) => {
-            if (typeof p === 'number') {
-                p = '*' // limitation: support only validation for each element of array
-            }
-            result[p] = result[p] || {}
-            result = result[p]
-        });
-        const existingRules: Map<string, ValidationRule> | undefined = result[PluginID];
-        const newRuleFunction = r.rule.toString();
-        if (existingRules) {
-            if (existingRules.has(newRuleFunction)) {
-                return;
-            }
-            existingRules.set(newRuleFunction, r);
-            return;
-        }
-        const newMap: Map<string, ValidationRule> = new Map();
-        newMap.set(newRuleFunction, r);
-        result[PluginID] = newMap;
+class ValidatorInstance<T> {
+    validators: Validator[] = [];
+
+    constructor(public root: State<StateValueAtRoot>) {
     }
 
-    getErrors(l: State<StateValueAtPath>,
-        depth: number,
-        filter?: (e: ValidationError) => boolean,
-        first?: boolean): ReadonlyArray<ValidationError> {
+    isRequired(state: State<T>) {
+        return this.validators.filter(v => v.required).some(v => this.pathToTargets(v.path, state).length > 0);
+    }
 
-        let result: ValidationError[] = [];
-        const consistentResult = () => result.length === 0 ? emptyErrors : result;
+    valid(state: State<T>) {
+        return this.errors(state).length === 0;
+    }
 
-        if (depth === 0) {
-            return consistentResult();
-        }
+    errors(state: State<T>) {
+        const errors: string[] = [];
 
-        const [existingRules, nestedRulesKeys] = this.getRulesAndNested(l.path);
-        for (let i = 0; i < existingRules.length; i += 1) {
-            const r = existingRules[i];
-            if (!r.rule(l.value)) {
-                const err = {
-                    path: l.path,
-                    message: typeof r.message === 'function' ? r.message(l.value) : r.message,
-                    severity: r.severity
-                };
-                if (!filter || filter(err)) {
-                    result.push(err)
-                    if (first) {
-                        return result;
+        for (const validator of this.validators) {
+            const targets = this.pathToTargets(validator.path, state);
+
+            for (const target of targets) {
+                let valid = true;
+
+                // use traditional loop to ensure all subscriptions occur in when functions
+                for (const condition of validator.conditions) {
+                    if (!this.conditionalValid(validator.path, condition, target)) {
+                        valid = false;
                     }
+                }
+
+                if (!valid) {
+                    continue;
+                }
+
+                if (!validator.fn(target.state.get())) {
+                    errors.push(validator.message || 'This field is not valid.');
                 }
             }
         }
-        if (depth === 1) {
-            return consistentResult();
+
+        return errors;
+    }
+
+    public pathToTargets(path: Path, state: State<any>, iterate: boolean = true, parent?: NestedState): NestedState[] {
+        const target = { state, parent };
+
+        if (Array.isArray(state)) {
+            if (!iterate) {
+                return [target];
+            }
+
+            let items: NestedState[] = [];
+
+            state.forEach((item, index) => {
+                items = [...items, ...this.pathToTargets(path, item, iterate, target)];
+            });
+
+            return items;
         }
-        if (nestedRulesKeys.length === 0) {
-            // console.log('getResults nested rules 0 length', result)
-            return consistentResult();
+
+        const statePaths = state.path.slice(0);
+        const requestedPaths = path.slice(0);
+
+        while (requestedPaths.length) {
+            if (!statePaths.length) {
+                const next = requestedPaths.shift();
+
+                if (!next) {
+                    throw new Error('should not happen');
+                }
+
+                return this.pathToTargets(path, state.nested(next), iterate, target);
+            }
+
+            if (typeof statePaths[0] === 'string') {
+                if (statePaths[0] === requestedPaths[0]) {
+                    requestedPaths.shift();
+                    statePaths.shift();
+
+                    continue;
+                }
+
+                // paths do not match, skip
+                return [];
+            }
+
+            statePaths.shift();
         }
-        const nestedInst = l;
-        if (nestedInst.keys === undefined) {
-            // console.log('getResults no nested inst', result)
-            return consistentResult();
+
+        return [target];
+    }
+
+    private conditionalValid(path: Path, condition: Condition, nested: NestedState): boolean {
+        if (Array.isArray(nested.state)) {
+            return nested.state.every((t) => this.conditionalValid(path, condition, { state: t, parent: nested }));
         }
-        if (Array.isArray(nestedInst)) {
-            if (nestedRulesKeys.includes('*')) {
-                for (let i = 0; i < nestedInst.length; i += 1) {
-                    const n = nestedInst[i];
-                    result = result.concat(
-                        Validation(n as State<StateValueAtPath>)
-                            .errors(filter, depth - 1, first));
-                    if (first && result.length > 0) {
-                        return result;
-                    }
+
+        let target;
+
+        if (!nested.parent) {
+            target = this.root;
+
+            const paths = nested.state.path.slice(0);
+            let stop = condition.root.path.length;
+
+            if (Array.isArray(condition.root)) {
+                stop += 1;
+            }
+
+            while (target.path.length < stop) {
+                const next = paths.shift();
+
+                if (next !== undefined) {
+                    target = target.nested(next);
                 }
             }
-            // validation for individual array elements is not supported, it is covered by foreach above
-            // for (let i = 0; i < nestedRulesKeys.length; i += 1) {
-            //     const k = nestedRulesKeys[i];
-            //     // Validation rule exists,
-            //     // but the corresponding nested link may not be created,
-            //     // (because it may not be inferred automatically)
-            //     // because the original array value cas miss the corresponding index
-            //     // The design choice is to skip validation in this case.
-            //     // A client can define per array level validation rule,
-            //     // where existance of the index can be cheched.
-            //     if (nestedInst[k] !== undefined) {
-            //         result = result.concat((nestedInst[k] as State<StateValueAtPath, ValidationExtensions>)
-            //             .extended.errors(filter, depth - 1, first));
-            //         if (first && result.length > 0) {
-            //             return result;
-            //         }
-            //     }
-            // }
         } else {
-            for (let i = 0; i < nestedRulesKeys.length; i += 1) {
-                const k = nestedRulesKeys[i];
-                // Validation rule exists,
-                // but the corresponding nested link may not be created,
-                // (because it may not be inferred automatically)
-                // because the original array value cas miss the corresponding index
-                // The design choice is to skip validation in this case.
-                // A client can define per array level validation rule,
-                // where existance of the index can be cheched.
-                if (nestedInst[k] !== undefined) {
-                    result = result.concat(
-                        Validation(nestedInst[k] as State<StateValueAtPath>)
-                            .errors(filter, depth - 1, first));
-                    if (first && result.length > 0) {
-                        return result;
-                    }
+            target = nested.parent;
+
+            while (target.state.path.filter(f => typeof f !== 'number').toString() !== condition.path.toString()) {
+                if (target.parent) {
+                    target = target.parent;
+                } else {
+                    throw new Error('not sure how to handle');
                 }
             }
+
+            target = target.state;
         }
-        return consistentResult();
+
+        return condition.fn(target, condition.root);
     }
 }
 
-// tslint:disable-next-line: function-name
-export function Validation(): Plugin;
-export function Validation<S>($this: State<S>): ValidationExtensions<S>;
-export function Validation<S>($this?: State<S>): Plugin | ValidationExtensions<S> {
-    if ($this) {
-        let state = $this;
+function buildProxy(
+    instance: ValidatorInstance<any>,
+    path: Path,
+    state: State<any>,
+    conditions: Condition[],
+): any {
+    return new Proxy({}, {
+        apply(t: (fieldValidator: ValidateFn<any>) => void, thisArg: any, argArray?: any): any {
+            t.apply(thisArg, argArray);
+        },
+        get(_: any, nestedProp: PropertyKey) {
+            if (typeof nestedProp === 'symbol') {
+                throw new Error('Symbols are not supported.');
+            }
 
-        const [plugin] = state.attach(PluginID);
-        if (plugin instanceof Error) {
-            throw plugin
-        }
-        const instance = plugin as ValidationPluginInstance<S>;
+            const cleanPath = path.filter(p => typeof p !== 'number');
 
-        const inst = instance;
-        return {
-            validate: (r, m, s) => {
-                inst.addRule(state.path, {
-                    rule: r,
-                    message: m,
-                    severity: s || 'error'
-                })
-            },
-            validShallow(): boolean {
-                return inst.getErrors(state, 1, undefined, true).length === 0
-            },
-            valid(): boolean {
-                return inst.getErrors(state, Number.MAX_SAFE_INTEGER, undefined, true).length === 0
-            },
-            invalidShallow(): boolean {
-                return inst.getErrors(state, 1, undefined, true).length !== 0
-            },
-            invalid(): boolean {
-                return inst.getErrors(state, Number.MAX_SAFE_INTEGER, undefined, true).length !== 0
-            },
-            errors: (filter, depth, first) => {
-                return inst.getErrors(state, depth === undefined ? Number.MAX_SAFE_INTEGER : depth, filter, first);
-            },
-            firstError: (filter, depth) => {
-                const r = inst.getErrors(state, depth === undefined ? Number.MAX_SAFE_INTEGER : depth, filter, true);
-                if (r.length === 0) {
-                    return {};
-                }
-                return r[0];
-            },
-        }
+            if (nestedProp === 'path') {
+                return cleanPath;
+            }
+
+            if (nestedProp === 'whenType') {
+                return (key: any, value: any) => buildProxy(instance, path, state, [
+                    ...conditions,
+                    {
+                        fn: (s) => s[key].get() === value,
+                        path: cleanPath,
+                        root: instance.pathToTargets(cleanPath, instance.root, false)[0].state,
+                    },
+                ]);
+            }
+
+            if (nestedProp === 'when') {
+                return (when: ValidateFn<any>, ...depends: any[]) => {
+                    const dependStates = depends.map(d => {
+                        return instance.pathToTargets(d.path, instance.root, false)[0].state;
+                    });
+
+                    return buildProxy(instance, path, state, [
+                        ...conditions,
+                        {
+                            fn: (value) => {
+                                return when(value, ...dependStates);
+                            },
+                            path: cleanPath,
+                            root: instance.pathToTargets(cleanPath, instance.root, false)[0].state,
+                        },
+                    ]);
+                };
+            }
+
+            if (nestedProp === 'required') {
+                return (message?: string) => {
+                    instance.validators.push({
+                        fn: (value => Array.isArray(value) ? value.length > 0 : !!value),
+                        path: cleanPath,
+                        required: true,
+                        message: message || 'This field is required',
+                        conditions,
+                    });
+                };
+            }
+
+            if (nestedProp === 'validate') {
+                return (nestedValidator: ValidateFn<any>, message?: string) => {
+                    instance.validators.push({
+                        fn: nestedValidator,
+                        path: cleanPath,
+                        message,
+                        conditions,
+                    });
+                };
+            }
+
+            return buildProxy(instance, [...path, nestedProp], state, conditions.slice(0));
+        },
+    });
+}
+
+type PathFields<S> = (keyof S)[] | ((s: State<S extends (infer T)[] ? T : S>) => boolean);
+
+interface PathValidator<S> {
+    valid(fields?: PathFields<S>): boolean;
+
+    required(): boolean;
+
+    errors(fields?: PathFields<S>): string[];
+}
+
+export function Validation<T>(input: State<T>): PathValidator<T> {
+    const [instance] = input.attach(ValidationId);
+
+    if (instance instanceof Error) {
+        throw new Error(`Forgot to run ValidationAttach()`);
     }
+
+    if (!(instance instanceof ValidatorInstance)) {
+        throw new Error('Expected plugin to be of ValidatorInstance');
+    }
+
     return {
-        id: PluginID,
-        init: () => new ValidationPluginInstance() as {}
-    }
+        valid(fields: PathFields<T>): boolean {
+            return this.errors(fields).length === 0;
+        },
+        required(): boolean {
+            return instance.isRequired(input);
+        },
+        errors(fields: PathFields<T>): string[] {
+            if (fields === undefined) {
+                return instance.errors(input);
+            }
+
+            let errors: string[] = [];
+
+            if (typeof fields === 'function') {
+                if (Array.isArray(input)) {
+                    input.forEach(item => {
+                        // @ts-ignore
+                        if (fields(item)) {
+                            errors = [...errors, ...instance.errors(item)];
+                        }
+                    });
+                }
+            } else {
+                for (const field of fields) {
+                    errors = [...errors, ...instance.errors(input.nested(field))];
+                }
+            }
+
+            return errors;
+        },
+    };
+}
+
+export function ValidationAttach<T>(state: State<T>, config: ((validator: DetectValidator<T>) => void)) {
+    state.attach(() => ({
+        id: ValidationId,
+        init: (root) => {
+            const instance = new ValidatorInstance(root);
+
+            const api = buildProxy(instance, state.path, state, []);
+
+            config(api);
+
+            return instance as PluginCallbacks;
+        },
+    }));
 }
